@@ -8,6 +8,13 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use image::GenericImageView;
 use eframe::egui::{self, Align, Color32, Layout, RichText, Stroke, TextEdit, Ui, Vec2};
 use rand::{Rng, RngCore, distributions::Uniform, seq::SliceRandom};
+use data_encoding::BASE32;
+use hmac::Hmac;
+use hmac::digest::Update;
+use sha1::Sha1;
+type HmacSha1 = Hmac<Sha1>;
+use reqwest::blocking::Client;
+use sha3::{Digest, Keccak512};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 use std::{
@@ -15,7 +22,9 @@ use std::{
     io::{Cursor, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const FORMAT_VERSION: u8 = 1;
@@ -86,6 +95,8 @@ struct VaultFile {
 #[derive(Default, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 struct VaultData {
     entries: Vec<Entry>,
+    #[serde(default)]
+    mfa_secret: Option<String>, // base64-encoded raw secret bytes when MFA enabled
 }
 
 #[derive(Clone, Serialize, Deserialize, Default, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
@@ -209,6 +220,17 @@ struct PassbeeApp {
     pairing_peer: String,
     pairing_status: String,
     pairing_listener: Option<TcpListener>,
+    pairing_open: bool,
+    leak_check_receiver: Option<mpsc::Receiver<Result<PasswordLeakCheck, String>>>,
+    leak_check_in_progress: bool,
+    // MFA unlock flow
+    pending_vault: Option<VaultData>,
+    pending_path: Option<PathBuf>,
+    mfa_required: bool,
+    mfa_code_input: String,
+    // MFA setup in-settings
+    mfa_setup_display_secret: Option<String>,
+    mfa_verify_code: String,
 }
 
 impl Drop for PassbeeApp {
@@ -229,6 +251,24 @@ impl Drop for PassbeeApp {
 }
 
 impl PassbeeApp {
+    fn start_async_password_check(&mut self, password: &str) {
+        if self.leak_check_in_progress {
+            return;
+        }
+        let pw = password.to_string();
+        let (tx, rx) = mpsc::channel::<Result<PasswordLeakCheck, String>>();
+        self.leak_check_in_progress = true;
+        self.status = Some("Checking password against leak database...".into());
+        self.leak_check_receiver = Some(rx);
+
+        thread::spawn(move || {
+            let res = match check_password_leak(&pw) {
+                Ok(r) => Ok(r),
+                Err(e) => Err(e.to_string()),
+            };
+            let _ = tx.send(res);
+        });
+    }
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let preferences_path = preferences_path();
         let preferences = load_preferences(&preferences_path);
@@ -342,6 +382,15 @@ impl PassbeeApp {
             pairing_peer: String::new(),
             pairing_status: String::new(),
             pairing_listener: None,
+            pairing_open: false,
+            leak_check_receiver: None,
+            leak_check_in_progress: false,
+            pending_vault: None,
+            pending_path: None,
+            mfa_required: false,
+            mfa_code_input: String::new(),
+            mfa_setup_display_secret: None,
+            mfa_verify_code: String::new(),
         }
     }
 
@@ -407,6 +456,44 @@ impl PassbeeApp {
     }
 
     fn lifecycle_windows(&mut self, ctx: &egui::Context) {
+        // Poll pairing listener each update only when the pairing window is open.
+        if self.pairing_open && self.pairing_listener.is_some() {
+            self.poll_pairing_listener();
+        }
+
+        // If an async leak-check is in progress, poll the receiver for results.
+        if let Some(rx) = &self.leak_check_receiver {
+            match rx.try_recv() {
+                Ok(Ok(result)) => {
+                    // Successful check
+                    if result.leaked {
+                        self.status = Some(format!(
+                            "Warning: This password appears in leaked databases. Count: {}, Pattern: {}, Wordlist: {}",
+                            result.count,
+                            result.pattern,
+                            if result.wordlist { "yes" } else { "no" }
+                        ));
+                    } else {
+                        self.status = Some("This password does not appear in known leaked databases.".into());
+                    }
+                    self.leak_check_in_progress = false;
+                    self.leak_check_receiver = None;
+                }
+                Ok(Err(err)) => {
+                    self.error = Some(err);
+                    self.leak_check_in_progress = false;
+                    self.leak_check_receiver = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    // Still waiting
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.error = Some("Leak check worker disconnected unexpectedly.".into());
+                    self.leak_check_in_progress = false;
+                    self.leak_check_receiver = None;
+                }
+            }
+        }
         if self.new_vault_confirm {
             let mut open = self.new_vault_confirm;
             egui::Window::new("Create new vault?")
@@ -455,8 +542,7 @@ impl PassbeeApp {
                         }
                         if ui
                             .add(
-                                egui::Button::new("Delete user")
-                                    .fill(Color32::from_rgb(177, 65, 57)),
+                                egui::Button::new("Delete user").fill(Color32::from_rgb(177, 65, 57)),
                             )
                             .clicked()
                         {
@@ -547,10 +633,18 @@ impl PassbeeApp {
         }
         match verified_user_vault_path(username, &self.users, &self.master) {
             Ok((path, vault)) => {
-                self.path = path;
-                self.vault = vault;
-                self.selected = self.vault.entries.first().map(|_| 0);
-                self.view = View::Vault;
+                // If the vault has MFA configured, require TOTP before completing unlock
+                if vault.mfa_secret.is_some() {
+                    self.pending_vault = Some(vault);
+                    self.pending_path = Some(path);
+                    self.mfa_required = true;
+                    self.status = Some("Enter your one-time code from your authenticator app.".into());
+                } else {
+                    self.path = path;
+                    self.vault = vault;
+                    self.selected = self.vault.entries.first().map(|_| 0);
+                    self.view = View::Vault;
+                }
             }
             Err(_) => self.error = Some("Wrong username or master password.".into()),
         }
@@ -609,6 +703,11 @@ impl PassbeeApp {
         self.entry_image_data.zeroize();
         self.editor_open = false;
         self.generator_open = false;
+        self.pairing_open = false;
+        self.pairing_code.clear();
+        self.pairing_peer.clear();
+        self.pairing_status.clear();
+        self.pairing_listener = None;
         self.view = View::Unlock;
         self.path = self.active_path_for_username(self.username.trim());
         self.status = Some(format!("Vault locked for {}.", self.username.trim()));
@@ -619,6 +718,44 @@ impl PassbeeApp {
             Ok(()) => self.status = Some("Vault saved.".into()),
             Err(error) => self.error = Some(error.to_string()),
         }
+    }
+
+    fn generate_mfa_secret(&self) -> (String, String) {
+        // returns (base64, base32) pair for storage and display
+        let mut secret = vec![0u8; 20];
+        rand::thread_rng().fill_bytes(&mut secret);
+        let b64 = BASE64.encode(&secret);
+        let b32 = BASE32.encode(&secret);
+        (b64, b32)
+    }
+
+    fn verify_totp(&self, secret_b64: &str, code: &str) -> bool {
+        let secret_bytes = match BASE64.decode(secret_b64.as_bytes()) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        for offset in -1i64..=1i64 {
+            let counter = ((now as i64 / 30) + offset) as u64;
+            let mut counter_bytes = [0u8; 8];
+            counter_bytes.copy_from_slice(&counter.to_be_bytes());
+            let mut mac = match hmac::Hmac::<sha1::Sha1>::new_from_slice(&secret_bytes) {
+                Ok(m) => m,
+                Err(_) => return false,
+            };
+            mac.update(&counter_bytes);
+            let result = hmac::Mac::finalize(mac).into_bytes();
+            let offset = (result[19] & 0x0f) as usize;
+            let code_u32 = ((u32::from(result[offset]) & 0x7f) << 24)
+                | ((u32::from(result[offset + 1]) & 0xff) << 16)
+                | ((u32::from(result[offset + 2]) & 0xff) << 8)
+                | (u32::from(result[offset + 3]) & 0xff);
+            let totp = code_u32 % 1_000_000;
+            if format!("{:06}", totp) == code {
+                return true;
+            }
+        }
+        false
     }
 
     fn start_new_vault(&mut self) {
@@ -781,20 +918,20 @@ impl PassbeeApp {
 
     fn auth_view(&mut self, ui: &mut Ui, create: bool) {
         ui.vertical_centered(|ui| {
-            ui.add_space(32.0);
+            ui.add_space(10.0);
             if let Some(logo) = &self.brand_logo {
                 ui.add(
                     egui::Image::new(logo)
-                        .fit_to_exact_size(Vec2::splat(66.0))
+                        .fit_to_exact_size(Vec2::splat(64.0))
                         .maintain_aspect_ratio(true),
                 );
             } else {
-                bee_symbol(ui, 58.0, self.accent());
+                bee_symbol(ui, 54.0, self.accent());
             }
-            ui.add_space(8.0);
+            ui.add_space(6.0);
             ui.label(RichText::new("PASSBEE").small().strong().color(self.accent()));
-            ui.add_space(14.0);
-            ui.heading(RichText::new(if create { "Make yourself at home" } else { "Welcome back" }).size(28.0));
+            ui.add_space(8.0);
+            ui.heading(RichText::new(if create { "Make yourself at home" } else { "Welcome back" }).size(26.0));
             ui.label(RichText::new(if create {
                 "A fresh start for your private space."
             } else {
@@ -804,7 +941,7 @@ impl PassbeeApp {
             } else {
                 Color32::from_rgb(105, 117, 125)
             }));
-            ui.add_space(22.0);
+            ui.add_space(12.0);
             egui::Frame::new()
                 .fill(if self.preferences.theme == Theme::Dark {
                     Color32::from_rgb(32, 39, 49)
@@ -820,11 +957,12 @@ impl PassbeeApp {
                     },
                 ))
                 .corner_radius(12)
-                .inner_margin(30.0)
+                .inner_margin(18.0)
                 .show(ui, |ui| {
-                    ui.set_width(360.0);
+                    ui.set_min_width(260.0);
+                    ui.set_max_width(360.0);
                     ui.label(RichText::new("User").strong());
-                    ui.add_space(7.0);
+                    ui.add_space(6.0);
                     let response = ui.add(
                         TextEdit::singleline(&mut self.username)
                             .hint_text("Username")
@@ -833,7 +971,7 @@ impl PassbeeApp {
                     if create && response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         self.create_vault();
                     }
-                    ui.add_space(14.0);
+                    ui.add_space(10.0);
                     ui.label(
                         RichText::new(if create {
                             "Master password"
@@ -842,7 +980,7 @@ impl PassbeeApp {
                         })
                         .strong(),
                     );
-                    ui.add_space(7.0);
+                    ui.add_space(6.0);
                     let response = ui.add(
                         TextEdit::singleline(&mut self.master)
                             .password(true)
@@ -852,91 +990,82 @@ impl PassbeeApp {
                         self.unlock();
                     }
                     if create {
-                        ui.add_space(14.0);
+                        ui.add_space(10.0);
                         ui.label(RichText::new("Confirm password").strong());
-                        ui.add_space(7.0);
+                        ui.add_space(6.0);
                         ui.add(
                             TextEdit::singleline(&mut self.confirmation)
                                 .password(true)
                                 .desired_width(ui.available_width()),
                         );
                     }
-                    ui.add_space(20.0);
-                    ui.horizontal_centered(|ui| {
-                        if ui
-                            .add_sized(
-                                [220.0, 38.0],
-                                egui::Button::new(if create {
-                                    "Create vault"
+                    ui.add_space(12.0);
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(ui.available_width(), 36.0),
+                        Layout::centered_and_justified(egui::Direction::LeftToRight),
+                        |ui| {
+                            if ui
+                                .add_sized(
+                                    [200.0, 36.0],
+                                    egui::Button::new(if create {
+                                        "Create vault"
+                                    } else {
+                                        "Unlock vault"
+                                    })
+                                    .fill(self.accent()),
+                                )
+                                .clicked()
+                            {
+                                if create {
+                                    self.create_vault();
                                 } else {
-                                    "Unlock vault"
-                                })
-                                .fill(self.accent()),
-                            )
-                            .clicked()
-                        {
-                            if create {
-                                self.create_vault();
-                            } else {
-                                self.unlock();
+                                    self.unlock();
+                                }
                             }
-                        }
-                    });
+                        },
+                    );
                     if let Some(error) = &self.error {
-                        ui.add_space(12.0);
+                        ui.add_space(8.0);
                         ui.label(RichText::new(error).color(Color32::from_rgb(177, 65, 57)));
                     }
                 });
-            ui.add_space(20.0);
+            ui.add_space(10.0);
             ui.label(
                 RichText::new(format!("Stored locally at {}", self.path.display()))
                     .small()
                     .color(Color32::from_rgb(145, 151, 161)),
             );
-            ui.add_space(18.0);
-            ui.group(|ui| {
-                ui.set_min_width(360.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("Device pairing").strong());
-                    ui.add_space(6.0);
-                    ui.horizontal_centered(|ui| {
-                        if ui.button("Start pairing").clicked() {
-                            self.start_pairing_listener();
-                        }
-                        if ui.button("Connect").clicked() {
-                            self.connect_to_pairing_peer();
-                        }
-                    });
-                    ui.add_space(4.0);
-                    ui.add(
-                        TextEdit::singleline(&mut self.pairing_peer)
-                            .hint_text("Peer host:port")
-                            .desired_width(220.0),
-                    );
-                    if !self.pairing_code.is_empty() {
-                        ui.add_space(4.0);
-                        ui.label(RichText::new(format!("Pairing code: {}", self.pairing_code)).small());
-                    }
-                    if !self.pairing_status.is_empty() {
-                        ui.add_space(4.0);
-                        ui.label(RichText::new(self.pairing_status.as_str()).small());
-                    }
-                });
-            });
             if !create {
-                ui.add_space(20.0);
-                ui.horizontal_centered(|ui| {
-                    if ui.button("Create user").clicked() {
-                        self.start_new_vault();
-                    }
-                    if ui.button("Delete user").clicked() {
-                        self.clear_messages();
-                        self.delete_user_confirm = true;
-                    }
-                });
+                ui.add_space(10.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(ui.available_width().max(260.0), 36.0),
+                    Layout::centered_and_justified(egui::Direction::LeftToRight),
+                    |ui| {
+                        let button_width = 116.0;
+                        let total_width = button_width * 2.0 + 8.0;
+                        ui.set_min_width(total_width);
+                        ui.set_max_width(total_width);
+                        ui.horizontal_centered(|ui| {
+                            if ui
+                                .add_sized([button_width, 30.0], egui::Button::new("Create user"))
+                                .clicked()
+                            {
+                                self.start_new_vault();
+                            }
+                            ui.add_space(8.0);
+                            if ui
+                                .add_sized([button_width, 30.0], egui::Button::new("Delete user"))
+                                .clicked()
+                            {
+                                self.clear_messages();
+                                self.delete_user_confirm = true;
+                            }
+                        });
+                    },
+                );
             }
             if let Some(status) = &self.status {
-                ui.add_space(10.0);
+                ui.add_space(8.0);
                 ui.label(RichText::new(status).color(self.accent()));
             }
         });
@@ -980,6 +1109,9 @@ impl PassbeeApp {
                             self.generated.zeroize();
                             self.generator_length = self.preferences.default_password_length;
                             self.generator_open = true;
+                        }
+                        if ui.button("Pairing").on_hover_text("Pair this vault with another device").clicked() {
+                            self.pairing_open = true;
                         }
                         if ui
                             .add(
@@ -1045,6 +1177,36 @@ impl PassbeeApp {
                         );
                     });
                 }
+            if self.mfa_required {
+                ui.add_space(8.0);
+                ui.label(RichText::new("Two-factor required").small().strong());
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.add(
+                        TextEdit::singleline(&mut self.mfa_code_input).desired_width(160.0),
+                    );
+                    if ui.button("Verify code").clicked() {
+                        if let Some(pv) = &self.pending_vault {
+                            if let Some(secret) = &pv.mfa_secret {
+                                if self.verify_totp(secret, &self.mfa_code_input) {
+                                    // complete unlock
+                                    if let Some(path) = self.pending_path.take() {
+                                        self.path = path;
+                                    }
+                                    self.vault = self.pending_vault.take().unwrap();
+                                    self.selected = self.vault.entries.first().map(|_| 0);
+                                    self.view = View::Vault;
+                                    self.mfa_required = false;
+                                    self.mfa_code_input.clear();
+                                    self.status = Some("Unlocked with multi-factor authentication.".into());
+                                } else {
+                                    self.error = Some("Invalid one-time code.".into());
+                                }
+                            }
+                        }
+                    }
+                });
+            }
                 for (index, name, username, image_data) in entries {
                     let selected = self.selected == Some(index);
                     let row_width = ui.available_width();
@@ -1158,33 +1320,44 @@ impl PassbeeApp {
         if self.generator_open {
             self.generator_window(ctx);
         }
+        if self.pairing_open {
+            self.pairing_window(ctx);
+        }
     }
 
     fn entry_view(&mut self, ui: &mut Ui, index: usize) {
         let entry = self.vault.entries[index].clone();
         let mut deleted = false;
+        let mut check_leak_clicked = false;
         ui.horizontal(|ui| {
-            self.render_entry_image_preview(ui, entry.image_data.as_deref(), &format!("entry-view-{index}"), 72.0);
-            ui.vertical(|ui| {
-                ui.heading(&entry.name);
-                ui.label(
-                    RichText::new("SECURE ENTRY")
-                        .small()
-                        .strong()
-                        .color(Color32::from_rgb(125, 132, 144)),
-                );
+                self.render_entry_image_preview(ui, entry.image_data.as_deref(), &format!("entry-view-{index}"), 72.0);
+                ui.vertical(|ui| {
+                    ui.heading(&entry.name);
+                    ui.label(
+                        RichText::new("SECURE ENTRY")
+                            .small()
+                            .strong()
+                            .color(Color32::from_rgb(125, 132, 144)),
+                    );
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("Delete").clicked() {
+                        self.selected = remove_entry(&mut self.vault.entries, index);
+                        self.save();
+                        deleted = true;
+                    }
+                    if ui.button("Edit").clicked() {
+                        self.edit_entry(index);
+                    }
+                    if ui.button("Check leak").clicked() {
+                        check_leak_clicked = true;
+                    }
+                });
             });
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.button("Delete").clicked() {
-                    self.selected = remove_entry(&mut self.vault.entries, index);
-                    self.save();
-                    deleted = true;
-                }
-                if ui.button("Edit").clicked() {
-                    self.edit_entry(index);
-                }
-            });
-        });
+        if check_leak_clicked {
+            let pw = self.vault.entries[index].password.clone();
+            self.check_password_leak_for_current_entry(&pw);
+        }
         if deleted {
             return;
         }
@@ -1500,6 +1673,53 @@ impl PassbeeApp {
                         }
                     });
                 });
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.label(RichText::new("Multi-factor authentication").strong().size(16.0));
+                ui.add_space(8.0);
+                if self.vault.mfa_secret.is_some() {
+                    ui.label("MFA is enabled for this user.");
+                    if ui.button("Disable MFA").clicked() {
+                        self.vault.mfa_secret = None;
+                        self.save();
+                        self.status = Some("Multi-factor authentication disabled.".into());
+                    }
+                } else {
+                    if ui.button("Enable MFA").clicked() {
+                        let (b64, b32) = self.generate_mfa_secret();
+                        self.vault.mfa_secret = Some(b64);
+                        // show base32 for user to add
+                        self.mfa_setup_display_secret = Some(b32);
+                        self.save();
+                        self.status = Some("MFA enabled locally. Add the secret to your authenticator app.".into());
+                    }
+                    if let Some(secret) = &self.mfa_setup_display_secret {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("Secret (base32) — enter into your authenticator:").small());
+                        ui.label(RichText::new(secret).monospace());
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                TextEdit::singleline(&mut self.mfa_verify_code)
+                                    .hint_text("Enter code from app")
+                                    .desired_width(140.0),
+                            );
+                            if ui.button("Verify").clicked() {
+                                if let Some(vault) = &self.vault.mfa_secret {
+                                    if self.verify_totp(vault, &self.mfa_verify_code) {
+                                        self.status = Some("MFA verified and enabled.".into());
+                                        self.mfa_setup_display_secret = None;
+                                        self.mfa_verify_code.clear();
+                                        self.save();
+                                    } else {
+                                        self.error = Some("Invalid code; try again.".into());
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.label("Passphrase words");
@@ -1541,6 +1761,51 @@ impl PassbeeApp {
             });
         self.settings_open = open && self.settings_open;
     }
+
+    fn save_entry(&mut self) {
+        self.clear_messages();
+        let name = self.entry_name.trim().to_string();
+        if name.is_empty() || self.entry_password.is_empty() {
+            self.error = Some("Name and password are required.".into());
+            return;
+        }
+        if let Some(index) = self.selected.filter(|i| *i < self.vault.entries.len()) {
+            self.vault.entries[index] = Entry {
+                name,
+                username: self.entry_username.trim().into(),
+                password: self.entry_password.clone(),
+                image_data: self.entry_image_data.clone(),
+                custom_fields: self.entry_custom_fields.clone(),
+            };
+        } else {
+            if self.vault.entries.iter().any(|e| e.name == name) {
+                self.error = Some("An entry with this name already exists.".into());
+                return;
+            }
+            self.vault.entries.push(Entry {
+                name,
+                username: self.entry_username.trim().into(),
+                password: self.entry_password.clone(),
+                image_data: self.entry_image_data.clone(),
+                custom_fields: self.entry_custom_fields.clone(),
+            });
+            self.selected = Some(self.vault.entries.len() - 1);
+        }
+        self.editor_open = false;
+        self.save();
+        self.clear_entry_editor();
+    }
+
+    fn clear_entry_editor(&mut self) {
+        self.entry_name.zeroize();
+        self.entry_username.zeroize();
+        self.entry_password.zeroize();
+        self.entry_image_data.zeroize();
+        self.entry_custom_fields.zeroize();
+        self.custom_field_label.zeroize();
+        self.custom_field_value.zeroize();
+    }
+
     fn edit_entry(&mut self, index: usize) {
         let entry = self.vault.entries[index].clone();
         self.entry_name.zeroize();
@@ -1670,6 +1935,7 @@ impl PassbeeApp {
                 }
             });
             ui.add_space(18.0);
+            let pw_clone = self.entry_password.clone();
             ui.horizontal(|ui| {
                 if ui.button("Generate").clicked() {
                     self.entry_password = match self.preferences.default_generator_mode {
@@ -1688,6 +1954,9 @@ impl PassbeeApp {
                         )
                         .unwrap_or_default(),
                     };
+                }
+                if ui.button("Check leak").clicked() {
+                    self.check_password_leak_from_entry(&pw_clone);
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui
@@ -1710,56 +1979,17 @@ impl PassbeeApp {
                 ui.add_space(10.0);
                 ui.label(RichText::new(error).color(Color32::from_rgb(177, 65, 57)));
             }
+            if let Some(status) = &self.status {
+                ui.add_space(8.0);
+                ui.label(RichText::new(status).color(self.accent()));
+            }
         });
         let was_open = self.editor_open;
         self.editor_open = open && self.editor_open;
         if was_open && !self.editor_open {
             self.clear_entry_editor();
         }
-    }
-
-    fn save_entry(&mut self) {
-        self.clear_messages();
-        let name = self.entry_name.trim().to_string();
-        if name.is_empty() || self.entry_password.is_empty() {
-            self.error = Some("Name and password are required.".into());
-            return;
-        }
-        if let Some(index) = self.selected.filter(|i| *i < self.vault.entries.len()) {
-            self.vault.entries[index] = Entry {
-                name,
-                username: self.entry_username.trim().into(),
-                password: self.entry_password.clone(),
-                image_data: self.entry_image_data.clone(),
-                custom_fields: self.entry_custom_fields.clone(),
-            };
-        } else {
-            if self.vault.entries.iter().any(|e| e.name == name) {
-                self.error = Some("An entry with this name already exists.".into());
-                return;
-            }
-            self.vault.entries.push(Entry {
-                name,
-                username: self.entry_username.trim().into(),
-                password: self.entry_password.clone(),
-                image_data: self.entry_image_data.clone(),
-                custom_fields: self.entry_custom_fields.clone(),
-            });
-            self.selected = Some(self.vault.entries.len() - 1);
-        }
-        self.editor_open = false;
-        self.save();
-        self.clear_entry_editor();
-    }
-
-    fn clear_entry_editor(&mut self) {
-        self.entry_name.zeroize();
-        self.entry_username.zeroize();
-        self.entry_password.zeroize();
-        self.entry_image_data.zeroize();
-        self.entry_custom_fields.zeroize();
-        self.custom_field_label.zeroize();
-        self.custom_field_value.zeroize();
+        
     }
 
     fn generator_window(&mut self, ctx: &egui::Context) {
@@ -1769,7 +1999,7 @@ impl PassbeeApp {
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .default_width(430.0)
+            .fixed_size(Vec2::new(460.0, 300.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.generator_mode, GeneratorMode::Password, "Password");
@@ -1811,23 +2041,21 @@ impl PassbeeApp {
                     } else {
                         Color32::from_rgb(244, 246, 248)
                     })
-                    .corner_radius(8)
-                    .inner_margin(10.0)
+                    .corner_radius(8.0)
+                    .inner_margin(8.0)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.add(
-                                TextEdit::singleline(&mut self.generated)
-                                    .desired_width(ui.available_width() - 55.0),
-                            );
-                            if ui.button("Copy").clicked() {
+                            ui.add_sized([360.0, 36.0], TextEdit::singleline(&mut self.generated));
+                            if ui.add_sized([52.0, 36.0], egui::Button::new("Copy")).clicked() {
                                 ui.ctx().copy_text(self.generated.clone());
                             }
                         });
                     });
+
                 ui.add_space(10.0);
                 if ui
                     .add_sized(
-                        [ui.available_width(), 38.0],
+                        [380.0, 38.0],
                         egui::Button::new(match self.generator_mode {
                             GeneratorMode::Password => "Generate password",
                             GeneratorMode::Passphrase => "Generate passphrase",
@@ -1860,6 +2088,136 @@ impl PassbeeApp {
         if was_open && !self.generator_open {
             self.generated.zeroize();
         }
+    }
+
+    fn pairing_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.pairing_open;
+        egui::Window::new("Device pairing")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(360.0)
+            .show(ctx, |ui| {
+                ui.label(RichText::new("Pair this vault with another device").strong());
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Start pairing").clicked() {
+                        self.start_pairing_listener();
+                    }
+                    if ui.button("Connect").clicked() {
+                        self.connect_to_pairing_peer();
+                    }
+                });
+                ui.add_space(8.0);
+                ui.add(
+                    TextEdit::singleline(&mut self.pairing_peer)
+                        .hint_text("Peer host:port")
+                        .desired_width(ui.available_width()),
+                );
+                ui.add_space(8.0);
+                if !self.pairing_code.is_empty() {
+                    ui.label(RichText::new(format!("Pairing code: {}", self.pairing_code)).small());
+                }
+                if !self.pairing_status.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(self.pairing_status.as_str()).small());
+                }
+            });
+        self.pairing_open = open && self.pairing_open;
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct XonPasswordCheckResponse {
+    #[serde(rename = "SearchPassAnon")]
+    search_pass_anon: Option<XonPasswordCheckRecord>,
+    #[serde(default, rename = "Error")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct XonPasswordCheckRecord {
+    #[serde(default)]
+    anon: String,
+    #[serde(default)]
+    char: String,
+    #[serde(default)]
+    count: String,
+    #[serde(default)]
+    wordlist: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PasswordLeakCheck {
+    count: u64,
+    leaked: bool,
+    pattern: String,
+    wordlist: bool,
+}
+
+fn keccak512_hex(input: &str) -> String {
+    let mut hasher = Keccak512::new();
+    Digest::update(&mut hasher, input.as_bytes());
+    hex::encode(Digest::finalize(hasher))
+}
+
+fn check_password_leak(password: &str) -> Result<PasswordLeakCheck> {
+    let trimmed = password.trim();
+    if trimmed.is_empty() {
+        bail!("Enter a password to check for leaks.");
+    }
+
+    let digest = keccak512_hex(trimmed);
+    let prefix = digest.chars().take(10).collect::<String>();
+    let url = format!("https://passwords.xposedornot.com/api/v1/pass/anon/{prefix}");
+
+    let client = Client::builder()
+        .user_agent("Passbee/1.0")
+        .timeout(Duration::from_secs(12))
+        .build()?;
+
+    let response = client.get(&url).send()?;
+    let status = response.status();
+    let payload: XonPasswordCheckResponse = match response.json() {
+        Ok(p) => p,
+        Err(_) => XonPasswordCheckResponse::default(),
+    };
+
+    if status.is_server_error() {
+        bail!("XposedOrNot is temporarily unavailable. Please try again later.");
+    }
+
+    if status == reqwest::StatusCode::NOT_FOUND || payload.error.as_deref() == Some("Not found") {
+        return Ok(PasswordLeakCheck::default());
+    }
+
+    let record = payload
+        .search_pass_anon
+        .ok_or_else(|| anyhow::anyhow!("Unexpected XposedOrNot response."))?;
+    let count = record.count.parse::<u64>().unwrap_or(0);
+    let leaked = count > 0 || record.anon.len() >= 10;
+
+    Ok(PasswordLeakCheck {
+        count,
+        leaked,
+        pattern: record.char,
+        wordlist: record.wordlist != 0,
+    })
+}
+
+impl PassbeeApp {
+    fn check_password_leak_status(&mut self, password: &str) {
+        // Run the leak check asynchronously to avoid blocking the UI.
+        self.clear_messages();
+        self.start_async_password_check(password);
+    }
+
+    fn check_password_leak_for_current_entry(&mut self, password: &str) {
+        self.check_password_leak_status(password);
+    }
+
+    fn check_password_leak_from_entry(&mut self, password: &str) {
+        self.check_password_leak_status(password);
     }
 }
 
@@ -2049,7 +2407,7 @@ fn bee_symbol(ui: &mut Ui, size: f32, accent: Color32) {
     painter.circle_filled(
         center + Vec2::new((-size) * 0.07, (-size) * 0.04),
         size * 0.025,
-        Color32::from_rgb(45, 42, 38),
+               Color32::from_rgb(45, 42, 38),
     );
     painter.circle_filled(
         center + Vec2::new(size * 0.07, (-size) * 0.04),
