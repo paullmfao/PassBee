@@ -13,6 +13,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 use std::{
     fs,
     io::{Cursor, Read, Write},
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -204,6 +205,10 @@ struct PassbeeApp {
     delete_user_confirm: bool,
     delete_user_password: String,
     settings_open: bool,
+    pairing_code: String,
+    pairing_peer: String,
+    pairing_status: String,
+    pairing_listener: Option<TcpListener>,
 }
 
 impl Drop for PassbeeApp {
@@ -333,6 +338,10 @@ impl PassbeeApp {
             delete_user_confirm: false,
             delete_user_password: String::new(),
             settings_open: false,
+            pairing_code: String::new(),
+            pairing_peer: String::new(),
+            pairing_status: String::new(),
+            pairing_listener: None,
         }
     }
 
@@ -691,6 +700,85 @@ impl PassbeeApp {
         }
     }
 
+    fn generate_pairing_code() -> String {
+        format!("PB-{}", rand::thread_rng().gen_range(100000..=999999))
+    }
+
+    fn start_pairing_listener(&mut self) {
+        match TcpListener::bind("0.0.0.0:0") {
+            Ok(listener) => {
+                let local_addr = listener.local_addr().unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap());
+                self.pairing_code = Self::generate_pairing_code();
+                self.pairing_peer = local_addr.to_string();
+                self.pairing_status = format!(
+                    "Listening on {}. Share this code with another device: {}",
+                    local_addr, self.pairing_code
+                );
+                self.pairing_listener = Some(listener);
+            }
+            Err(error) => {
+                self.pairing_status = format!("Pairing unavailable: {error}");
+            }
+        }
+    }
+
+    fn connect_to_pairing_peer(&mut self) {
+        let target = self.pairing_peer.trim();
+        if target.is_empty() {
+            self.pairing_status = "Enter a peer host:port like 192.168.1.10:41000 to pair.".into();
+            return;
+        }
+
+        match TcpStream::connect(target) {
+            Ok(mut stream) => {
+                let payload = format!("PASSBEE-PAIR {}\n", self.pairing_code.trim());
+                if stream.write_all(payload.as_bytes()).is_ok() {
+                    let mut response = [0u8; 128];
+                    let bytes = stream.read(&mut response).unwrap_or(0);
+                    let reply = String::from_utf8_lossy(&response[..bytes]);
+                    if reply.to_ascii_lowercase().contains("accepted") {
+                        self.pairing_status = format!("Paired successfully with {target}.");
+                    } else {
+                        self.pairing_status = format!("Connected to {target}, but the peer did not accept the pairing request.");
+                    }
+                } else {
+                    self.pairing_status = format!("Could not complete pairing with {target}.");
+                }
+            }
+            Err(error) => {
+                self.pairing_status = format!("Could not reach {target}: {error}");
+            }
+        }
+    }
+
+    fn poll_pairing_listener(&mut self) {
+        let Some(listener) = self.pairing_listener.as_mut() else {
+            return;
+        };
+
+        let _ = listener.set_nonblocking(true);
+        match listener.accept() {
+            Ok((mut stream, addr)) => {
+                let mut buffer = [0u8; 256];
+                let bytes = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..bytes]);
+                let accepted = request.trim().to_ascii_lowercase().contains("passbee-pair");
+                if accepted {
+                    let _ = stream.write_all(b"passbee-pair-accepted");
+                    self.pairing_status = format!("Paired with {addr}. This device is ready to sync securely.");
+                } else {
+                    self.pairing_status = format!("Connection received from {addr}, but the pairing request was invalid.");
+                }
+                self.pairing_listener = None;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => {
+                self.pairing_status = format!("Pairing listener error: {error}");
+                self.pairing_listener = None;
+            }
+        }
+    }
+
     fn auth_view(&mut self, ui: &mut Ui, create: bool) {
         ui.vertical_centered(|ui| {
             ui.add_space(32.0);
@@ -774,24 +862,26 @@ impl PassbeeApp {
                         );
                     }
                     ui.add_space(20.0);
-                    if ui
-                        .add_sized(
-                            [ui.available_width(), 38.0],
-                            egui::Button::new(if create {
-                                "Create vault"
+                    ui.horizontal_centered(|ui| {
+                        if ui
+                            .add_sized(
+                                [220.0, 38.0],
+                                egui::Button::new(if create {
+                                    "Create vault"
+                                } else {
+                                    "Unlock vault"
+                                })
+                                .fill(self.accent()),
+                            )
+                            .clicked()
+                        {
+                            if create {
+                                self.create_vault();
                             } else {
-                                "Unlock vault"
-                            })
-                            .fill(self.accent()),
-                        )
-                        .clicked()
-                    {
-                        if create {
-                            self.create_vault();
-                        } else {
-                            self.unlock();
+                                self.unlock();
+                            }
                         }
-                    }
+                    });
                     if let Some(error) = &self.error {
                         ui.add_space(12.0);
                         ui.label(RichText::new(error).color(Color32::from_rgb(177, 65, 57)));
@@ -803,9 +893,39 @@ impl PassbeeApp {
                     .small()
                     .color(Color32::from_rgb(145, 151, 161)),
             );
+            ui.add_space(18.0);
+            ui.group(|ui| {
+                ui.set_min_width(360.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("Device pairing").strong());
+                    ui.add_space(6.0);
+                    ui.horizontal_centered(|ui| {
+                        if ui.button("Start pairing").clicked() {
+                            self.start_pairing_listener();
+                        }
+                        if ui.button("Connect").clicked() {
+                            self.connect_to_pairing_peer();
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.add(
+                        TextEdit::singleline(&mut self.pairing_peer)
+                            .hint_text("Peer host:port")
+                            .desired_width(220.0),
+                    );
+                    if !self.pairing_code.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(format!("Pairing code: {}", self.pairing_code)).small());
+                    }
+                    if !self.pairing_status.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(self.pairing_status.as_str()).small());
+                    }
+                });
+            });
             if !create {
                 ui.add_space(20.0);
-                ui.horizontal_wrapped(|ui| {
+                ui.horizontal_centered(|ui| {
                     if ui.button("Create user").clicked() {
                         self.start_new_vault();
                     }
